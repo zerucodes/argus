@@ -9,13 +9,14 @@ import threading
 import json 
 import time
 from datetime import datetime
-
+import subprocess
+import os
+import functools
 def setup_config():
     config = None
-    version = '0.1.0'
-    featurecomment = 'Initial Revision'
-    log.basicConfig(level=log.INFO)
-
+    version = '2.0.0'
+    featurecomment = 'MQTT Integration'
+    log.basicConfig(level=log.DEBUG, format='%(asctime)s [%(levelname)s] %(funcName)s: %(message)s')    
     log.debug('Looking for config')
     # Set up config
     if yaml is not None:
@@ -70,7 +71,7 @@ class Device:
         self.sensor_topics = {}
         self.command_topics = {}
         self.client = client
-        
+        self.callbacks = {}
     def set_config(self):
         config =  {
             "name" : self.name,
@@ -130,7 +131,7 @@ class Device:
         return sensor
     
 
-    def generate_command_topic(self,device_class,name=None):
+    def generate_command_topic(self,device_class,name=None,callback=None):
         sensor = {}
         sensor['device_class'] = device_class.value
         sensor['name'] = name
@@ -152,17 +153,22 @@ class Device:
 
 
         del sensor['device_class']
-
+        if callback:
+            if sensor['command_topic'] not in self.callbacks:
+                self.callbacks[sensor['command_topic']] = callback
+                log.debug(f'Adding {sensor["command_topic"]} to callbacks dict')
+            else:
+                log.error(f'Command {sensor["command_topic"]} is already in callbacks dict')
         if sensor_name not in self.command_topics:
             self.command_topics[sensor_name] = sensor
             log.debug(f'Adding {sensor_name} to command_topics dict')
         else:
             log.error(f'Command {sensor_name} is already in command_topics dict')
-        if sensor_name not in self.sensor_topics:
-            self.sensor_topics[sensor_name] = sensor
-            log.debug(f'Adding {sensor_name} to sensor_topics dict')
-        else:
-            log.error(f'Sensor {sensor_name} is already in sensor_topics dict')
+        # if sensor_name not in self.sensor_topics:
+        #     self.sensor_topics[sensor_name] = sensor
+        #     log.debug(f'Adding {sensor_name} to sensor_topics dict')
+        # else:
+        #     log.error(f'Sensor {sensor_name} is already in sensor_topics dict')
 
     def publish_sensor_topics(self):
         for topic in self.sensor_topics:
@@ -249,7 +255,7 @@ def get_pc_sensor(sensor,type):
                     return get_ram_temperature()
     return None
 
-def on_message(client, userdata, message):
+def on_message(client, userdata, message,managed_devices=None):
     if isinstance(message.payload,bytes):
         payload = message.payload.decode()
     try:
@@ -257,48 +263,77 @@ def on_message(client, userdata, message):
     except Exception as e:
         log.debug(f'Non json payload')
     log.info(f'recieved payload {payload}')
-    if message.topic == f"homeassistant/light/m27q/screen_brightness/set":
-        if 'brightness' in payload:
-            value = payload['brightness']
-        else:
-            value = 0
-        log.debug(f"Received command to set screen brightness to {value}")
+    for device in  managed_devices:
+        for callback_topic in device.callbacks:
+            if message.topic == callback_topic:
+                device.callbacks[callback_topic](payload=payload,deviceName=device.name)
+    # if message.topic == f"homeassistant/light/m27q/screen_brightness/set":
+    #     if 'brightness' in payload:
+    #         value = payload['brightness']
+    #     else:
+    #         value = 0
+    #     log.debug(f"Received command to set screen brightness to {value}")
 
+def runCommand(command,enabled=False):
+    if (command):
+        try:
+            log.debug(f'Running command: {command}' if enabled else 'Running demo: {command}')
+            if enabled:
+                out = subprocess.run(command,capture_output=True)
+                if (out.returncode != 0):
+                    log.warning(f'{out}')
+                log.debug(f'{out}')
+                return json.loads(out.stdout.decode())
+        except Exception as e:
+            log.warning(f'Command Error {e}')
+
+def getPayloadAttr(payload,attr,default=0):
+    if attr in payload:
+        return payload[attr]
+    else:
+        return default
+    
+def setMonitorInput(monitorName,input):
+    log.debug(f"Setting {monitorName} {input} input")
+
+def getMonitors(client):
+    monitors = []
+    log.info(f'Initializing Display Monitors')
+    output = runCommand("VCPController.exe -getMonitors",enabled=True)['monitors']
+    for m in output:
+        monitor = Device(name=m['model'],model=m['name'],client=client) # Swap name and monitor due to model containing friendlier name and model being unique
+        monitor.generate_command_topic(DeviceClass.LIGHT,name='Screen Brightness',callback= lambda payload,deviceName:runCommand(enabled=True, command=f'VCPController.exe -setVCP --vcp=0x10 --value={int(getPayloadAttr(payload,"brightness",0)/255*100 )} --monitor="{deviceName}"'))
+        monitor.generate_command_topic(DeviceClass.BUTTON,name='USB-C', callback= lambda deviceName,payload=None:setMonitorInput(deviceName,'USB-C'))
+        monitor.generate_command_topic(DeviceClass.BUTTON,name='HDMI-1', callback= lambda deviceName,payload=None:setMonitorInput(deviceName,'HDMI-1'))
+        monitor.generate_command_topic(DeviceClass.BUTTON,name='HDMI-2', callback= lambda deviceName,payload=None:setMonitorInput(deviceName,'HDMI-2'))
+        monitor.generate_command_topic(DeviceClass.BUTTON,name='DisplayPort', callback= lambda deviceName,payload=None:setMonitorInput(deviceName,'DisplayPort'))
+        monitors.append(monitor)
+    return monitors
 
 def main():
     config = setup_config()
     broker =  config['mqtt_ip']
     port = 1883
     client = mqtt.Client()
-    # Set MQTT username and password if required
+    managed_devices = []
+
     client.username_pw_set(config['mqtt_username'], config['mqtt_password'])
     client.connect(broker, port)
     client.on_connect = lambda self, userdata, flags, rc: log.debug(f"Connected with result code {rc}")
     client.on_publish = lambda self, userdata, mid: log.debug(f"Message published with mid {mid}")
     client.on_subscribe = lambda self, userdata, mid, granted_qos: log.debug(f"Subscribed with mid {mid} and QoS {granted_qos}")
-    client.on_message = on_message
-    
-    monitor1 = Device(name='M27Q',model='M27Q',manufacturer='Gigabyte',client=client) 
-    # monitor2 = Device(name='U2722DE',model='U2722DE',manufacturer='Dell',client=client) 
-    monitor1.generate_command_topic(DeviceClass.LIGHT,name='Screen Brightness')
-    monitor1.publish_sensor(name='Screen Brightness',value=json.dumps({"state":'ON','brightness':77}))
-
-    monitor1.generate_command_topic(DeviceClass.BUTTON,name='USB-C')
-    monitor1.generate_command_topic(DeviceClass.BUTTON,name='HDMI-1')
-    monitor1.generate_command_topic(DeviceClass.BUTTON,name='DisplayPort')
-    
-    
-    monitor1.publish_command_topics()
-    monitor1.publish_sensor("ON",'USB-C')
-    monitor1.publish_sensor("ON",'HDMI-1')
 
     log.info(f'Initializing PC Device')
-    pc = Device(name=get_hw_attr('name'),model=get_hw_attr('model'),manufacturer=get_hw_attr('manufacturer'),mac='58:47:ca:72:46:a0',client=client)
+    pc = Device(name=get_hw_attr('name'),model=get_hw_attr('model'),manufacturer=get_hw_attr('manufacturer'),client=client)
+    managed_devices.append(pc)
+    monitors = getMonitors(client=client)
+    managed_devices.extend(monitors)
     initialize_pc_sensors(pc)
-    pc.publish_sensor_topics()
+    for device in managed_devices:
+        device.publish_command_topics()
+        device.publish_sensor_topics()
 
-    
-
+    client.on_message = functools.partial(on_message,managed_devices=managed_devices)
     threading.Thread(target=client.loop_forever, daemon=True).start()    
     log.info(f'Sending Sensor data on loop...')
     counter  = 0
